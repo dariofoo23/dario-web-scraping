@@ -1,1 +1,16 @@
 
+# First Login
+## Modify your runner just for the first login run:
+
+process.crawl(LinkedinSeleniumSpider, login_only="1", max_pages="1")
+
+## Test Pages
+
+process.crawl(LinkedinSeleniumSpider, max_pages="2")
+
+## Full Run
+
+process.crawl(LinkedinSeleniumSpider, login_only="0")
+
+
+
