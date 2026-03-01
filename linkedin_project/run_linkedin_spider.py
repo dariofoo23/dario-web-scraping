@@ -14,7 +14,7 @@ def main():
     profile_dir = r"C:\Users\Dario Martínez\Documents\selenium_profiles\linkedin"
     settings.set("SELENIUM_DRIVER_NAME", "chrome")
     settings.set("SELENIUM_DRIVER_EXECUTABLE_PATH", ChromeDriverManager().install())
-    settings.set("FEEDS", {"01_linkedin_companies.csv": {"format": "csv", "overwrite": False}})
+    settings.set("FEEDS", {"01_linkedin_companies.csv": {"format": "csv", "overwrite": True}})
     settings.set("SELENIUM_DRIVER_ARGUMENTS", [
     f"--user-data-dir={profile_dir}",
     "--profile-directory=Default",
@@ -23,7 +23,7 @@ def main():
     ])
 
     process = CrawlerProcess(settings)
-    process.crawl(LinkedinSeleniumSpider, max_pages="2")
+    process.crawl(LinkedinSeleniumSpider, max_pages=None)
     process.start()
 
 

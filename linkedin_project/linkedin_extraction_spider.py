@@ -5,6 +5,9 @@ import scrapy
 from scrapy.item import Item, Field
 from scrapy.loader import ItemLoader
 from scrapy_selenium import SeleniumRequest
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
@@ -27,6 +30,7 @@ class Reviews(Item):
     url = Field()     # linkedin company page built from sales/company/<id>
     page = Field()
     source_url = Field()  # the current sales nav search page url
+    linkedin_id = Field()  # the extracted LinkedIn company ID (from sales/company/<id>)
 
 
 class LinkedinSeleniumSpider(scrapy.Spider):
@@ -35,7 +39,7 @@ class LinkedinSeleniumSpider(scrapy.Spider):
     start_urls = [
         "https://www.linkedin.com/sales/search/company?savedSearchId=1980479034&sessionId=FUTibHswSPW8UMM4eB2KFQ%3D%3D"
     ]
-
+    
     linkedin_company_page = "https://www.linkedin.com/company/{id}/"
 
     custom_settings = {
@@ -56,7 +60,12 @@ class LinkedinSeleniumSpider(scrapy.Spider):
     def __init__(self, login_only="0", max_pages=None, start_page="1", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.login_only = str(login_only) == "1"
-        self.max_pages = int(max_pages) if max_pages is not None else None
+
+        if max_pages in (None, "", "None", "0"):
+            self.max_pages = None
+        else:
+            self.max_pages = int(max_pages)
+
         self.start_page = int(start_page)
 
     def start_requests(self):
@@ -107,18 +116,182 @@ class LinkedinSeleniumSpider(scrapy.Spider):
         m = re.search(r"/sales/company/(\d+)", href)
         return m.group(1) if m else None
 
-    def _scroll_until_cards_stable(self, driver, wait, max_rounds=20, pause=(0.7, 1.2), stable_rounds=3):
+    def _get_scroll_container(self, driver):
+        results_ol = driver.find_element(By.XPATH, '//ol[contains(@class,"_border-search-results")]')
+
+        js_find_scroll_parent = """
+        function bestScrollableFrom(el){
+            let best = null;
+            let bestDelta = 0;
+            while (el) {
+                const d = el.scrollHeight - el.clientHeight;
+                const s = getComputedStyle(el);
+                const oy = s.overflowY;
+                if ((oy === 'auto' || oy === 'scroll') && d > bestDelta) {
+                    best = el;
+                    bestDelta = d;
+                }
+                el = el.parentElement;
+            }
+            return best;
+        }
+
+        const start = arguments[0];
+        let c = bestScrollableFrom(start);
+        if (c) return c;
+
+        // Fallback: scan common containers for the biggest scrollable area
+        const candidates = Array.from(document.querySelectorAll('div, main, section, aside'));
+        let best = null;
+        let bestDelta = 0;
+        for (const el of candidates) {
+            const s = getComputedStyle(el);
+            const oy = s.overflowY;
+            const d = el.scrollHeight - el.clientHeight;
+            if ((oy === 'auto' || oy === 'scroll') && d > bestDelta) {
+                best = el;
+                bestDelta = d;
+            }
+        }
+        return best || document.scrollingElement || document.documentElement;
         """
-        Scrolls down repeatedly until the number of /sales/company/ links stops increasing.
-        """
+        container = driver.execute_script(js_find_scroll_parent, results_ol)
+
+        # Debug: confirm we got a real scroller
+        tag, cls, st, sh, ch = driver.execute_script(
+            "return [arguments[0].tagName, arguments[0].className, arguments[0].scrollTop, arguments[0].scrollHeight, arguments[0].clientHeight];",
+            container
+        )
+        self.logger.info("SCROLLER tag=%s class=%r scrollTop=%s scrollH=%s clientH=%s", tag, cls, st, sh, ch)
+
+        return container
+    
+    def _iter_all_companies_on_page(self, driver, wait, max_rounds=200, pause=(0.9, 1.6), stable_rounds=12):
+
+        CARD_XPATH = (
+            '//ol[contains(@class,"_border-search-results")]'
+            '//li[contains(@class,"artdeco-list__item")][.//a[@data-anonymize="company-name"]]'
+        )
+        seen = set()
         stable = 0
+
+        container = self._get_scroll_container(driver)
+
+        # Focus the real scroll container (must receive wheel/scroll)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", container)
+        ActionChains(driver).move_to_element(container).pause(0.1).click().perform()
+        time.sleep(0.2)
+
+        for r in range(max_rounds):
+            new_this_round = 0
+
+            # ---- COLLECT VISIBLE CARDS ----
+            cards = driver.find_elements(By.XPATH, CARD_XPATH)
+            for card_el in cards:
+                try:
+                    name_el = card_el.find_element(By.XPATH, './/a[@data-anonymize="company-name"]')
+                    href = name_el.get_attribute("href") or ""
+                    cid = self._extract_sales_company_id(href)
+                    if not cid or cid in seen:
+                        continue
+
+                    seen.add(cid)
+                    new_this_round += 1
+
+                    def safe_text(xpath):
+                        try:
+                            return (card_el.find_element(By.XPATH, xpath).text or "").strip()
+                        except NoSuchElementException:
+                            return ""
+
+                    yield {
+                        "cid": cid,
+                        "companyName": (name_el.text or "").strip(),
+                        "industry": safe_text('.//span[@data-anonymize="industry"]'),
+                        "employees": safe_text('.//a[@data-anonymize="company-size"]'),
+                        "revenue": safe_text('.//span[@data-anonymize="revenue"]'),
+                    }
+
+                except (NoSuchElementException, StaleElementReferenceException):
+                    continue
+
+            # Stability based on new IDs
+            stable = stable + 1 if new_this_round == 0 else 0
+
+            # ---- READ SCROLL METRICS (BEFORE SCROLL) ----
+            st_before, sh, ch = driver.execute_script(
+                "return [arguments[0].scrollTop, arguments[0].scrollHeight, arguments[0].clientHeight];",
+                container
+            )
+
+            delta = int(ch * 0.9)
+
+            # ---- SCROLL (INSIDE LOOP) ----
+            driver.execute_script("""
+                const el = arguments[0];
+                const d  = arguments[1];
+
+                el.dispatchEvent(new WheelEvent('wheel', {deltaY: d, bubbles: true, cancelable: true}));
+                el.scrollTop = el.scrollTop + d;
+                el.dispatchEvent(new Event('scroll', {bubbles: true}));
+            """, container, delta)
+
+            time.sleep(0.25)
+
+            st_after = driver.execute_script("return arguments[0].scrollTop;", container)
+
+            # If scroll didn't move, wake it (PAGE_DOWN + retry)
+            if st_after <= st_before + 2:
+                try:
+                    ActionChains(driver).move_to_element(container).click().send_keys(Keys.PAGE_DOWN).perform()
+                except Exception:
+                    pass
+
+                time.sleep(0.25)
+
+                driver.execute_script("""
+                    const el = arguments[0];
+                    const d  = arguments[1];
+                    el.dispatchEvent(new WheelEvent('wheel', {deltaY: d, bubbles: true, cancelable: true}));
+                    el.scrollTop = el.scrollTop + d;
+                    el.dispatchEvent(new Event('scroll', {bubbles: true}));
+                """, container, delta)
+
+                time.sleep(0.25)
+
+                st_after = driver.execute_script("return arguments[0].scrollTop;", container)
+
+            # ---- STOP CONDITION (AFTER st_after EXISTS) ----
+            no_move = (st_after <= st_before + 2)
+
+            if stable >= stable_rounds and no_move:
+                time.sleep(0.4)
+                st2, sh2, ch2 = driver.execute_script(
+                    "return [arguments[0].scrollTop, arguments[0].scrollHeight, arguments[0].clientHeight];",
+                    container
+                )
+                no_move2 = (st2 <= st_before + 2)
+                sh_stable = (abs(sh2 - sh) <= 2)
+
+                if no_move2 and sh_stable:
+                    break
+
+            if r % 20 == 0:
+                self.logger.info(
+                    "SCROLL round=%s st_before=%s st_after=%s sh=%s ch=%s seen=%s new=%s stable=%s",
+                    r, st_before, st_after, sh, ch, len(seen), new_this_round, stable
+                )
+
+            time.sleep(random.uniform(*pause))
+
+    def _scroll_until_cards_complete(self, driver, max_rounds=80, pause=(1.1, 2.0), stable_rounds=12):
+        container = self._get_scroll_container(driver)
         last_count = -1
+        stable = 0
 
         for _ in range(max_rounds):
-            # Count company links currently loaded
-            html = driver.page_source
-            sel = scrapy.Selector(text=html)
-            count = len(sel.xpath('//a[contains(@href,"/sales/company/")]/@href').getall())
+            sel = scrapy.Selector(text=driver.page_source)
+            count = len(sel.xpath('//a[@data-anonymize="company-name"]/ancestor::li[1]').getall())
 
             if count == last_count:
                 stable += 1
@@ -126,15 +299,22 @@ class LinkedinSeleniumSpider(scrapy.Spider):
                 stable = 0
                 last_count = count
 
-            # If it didn't grow for a few rounds, we're done
-            if stable >= stable_rounds:
+            at_bottom = driver.execute_script(
+                "return Math.ceil(arguments[0].scrollTop + arguments[0].clientHeight) >= arguments[0].scrollHeight - 5;",
+                container
+            )
+
+            if stable >= stable_rounds and at_bottom:
                 return count
 
-            # Scroll down to trigger lazy load
-            driver.execute_script("window.scrollBy(0, 900);")
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollTop + 900;", container)
             time.sleep(random.uniform(*pause))
 
-        return last_count
+        # one last jump to bottom + short wait
+        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
+        time.sleep(2.0)
+        sel = scrapy.Selector(text=driver.page_source)
+        return len(sel.xpath('//a[@data-anonymize="company-name"]/ancestor::li[1]').getall())
 
     def parse_with_selenium(self, response):
         driver = response.meta["driver"]
@@ -191,7 +371,7 @@ class LinkedinSeleniumSpider(scrapy.Spider):
                 # Wait for the results list (container)
                 wait.until(
                     EC.presence_of_all_elements_located(
-                        (By.XPATH, './/li[contains(@class,"artdeco-list__item pl3 pv3 ")]')
+                        (By.XPATH, '//li[.//a[contains(@href,"/sales/company/")]]')
                     )
                 )
             except TimeoutException:
@@ -199,22 +379,46 @@ class LinkedinSeleniumSpider(scrapy.Spider):
                 driver.refresh()
                 time.sleep(2)
                 continue
+
+            """wait.until(lambda d: len(d.find_elements(
+                By.XPATH,
+                '//ol[contains(@class,"_border-search-results")]//a[@data-anonymize="company-name"]'
+            )) >= 5)"""
+
+            count = 0
+            for data in self._iter_all_companies_on_page(driver, wait):
+                count += 1
+                item = ItemLoader(Reviews())
+                
+                item.add_value("source_url", current_url)
+                item.add_value("page", page_num)
+                item.add_value("linkedin_id", data["cid"])
+                item.add_value("companyName", data["companyName"])
+                item.add_value("industry", data["industry"])
+                item.add_value("employees", data["employees"])
+                item.add_value("revenue", data["revenue"])
+                item.add_value("url", self.linkedin_company_page.format(id=data["cid"]))
+
+
+                yield item.load_item()
+
+            self.logger.info("Collected unique companies on page %s: %s", page_num, count)
             
             # Load all cards on the current page by scrolling
-            loaded = self._scroll_until_cards_stable(driver, wait)
+            """loaded = self._iter_all_companies_on_page(driver)
             self.logger.info("Loaded company links on page: %s", loaded)
 
             sel = scrapy.Selector(text=driver.page_source)
+            range_text = sel.xpath('normalize-space(//*[contains(text(),"of") and contains(text(),"-")][1])').get()
+            self.logger.info("Range text guess: %r", range_text)
 
-            self.logger.info("Title=%r", sel.xpath("//title/text()").get())
-            self.logger.info("Has /sales/company links: %d", len(sel.xpath('//a[contains(@href,"/sales/company/")]/@href').getall()))
             # IMPORTANT: select each result item (li), not the ol
             company_cards = sel.xpath(
-            './/li[contains(@class,"artdeco-list__item pl3 pv3 ")]'
+            '//a[@data-anonymize="company-name"]/ancestor::li[1]'
             )
 
             self.logger.info("PAGE=%s URL=%s cards=%d", page_num, current_url, len(company_cards))
-            self.logger.info("First card has company link? %s", bool(company_cards[0].xpath('.//a[contains(@href,"/sales/company/")]').get()) if company_cards else False)
+            self.logger.info("First card has company link? %s", bool(company_cards[0].xpath('//a[@data-anonymize="company-name"]/ancestor::li[1]').get()) if company_cards else False)
 
             for card in company_cards:
                 item = ItemLoader(Reviews(), selector=card)
@@ -249,7 +453,7 @@ class LinkedinSeleniumSpider(scrapy.Spider):
                 else:
                     item.add_value("url", None)
 
-                yield item.load_item()
+                yield item.load_item()"""
 
             # ---- Pagination: click Next button ----
             # Scroll to bottom so pagination appears/enables
